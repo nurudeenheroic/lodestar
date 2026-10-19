@@ -48,6 +48,10 @@ function parseTrustProxy(value) {
 
 const config = Object.freeze({
   nodeEnv: process.env.NODE_ENV ?? 'development',
+  // Demo-only safety gate. Demo scripts that fabricate reputation data
+  // (scripts/demo/boost-scores.js) must refuse to run unless DEMO_MODE=true,
+  // so an accidental run against a live deployment fails closed.
+  demoMode: process.env.DEMO_MODE === 'true',
   port: parseInt(process.env.PORT ?? '3001', 10),
   logLevel: process.env.LOG_LEVEL ?? 'info',
 
@@ -61,6 +65,14 @@ const config = Object.freeze({
   contract: {
     id: process.env.CONTRACT_ID,
     agentsId: process.env.AGENTS_CONTRACT_ID ?? null,
+    // Known non-demo deployment contract IDs; demo-only scripts must refuse
+    // to run against these even when DEMO_MODE=true.
+    knownNonDemoContractIds: Object.freeze(
+      (process.env.KNOWN_NON_DEMO_CONTRACT_IDS ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
   },
 
   // Warn at startup if AGENTS_CONTRACT_ID is missing so operators spot it
@@ -88,7 +100,14 @@ const config = Object.freeze({
     ? process.env.CORS_ORIGIN.split(',').map((s) => s.trim())
     : ['http://localhost:3000'],
 
+  // Whether CORS_ORIGIN was explicitly provided (vs. the localhost fallback
+  // above). Used by validateConfig() to fail startup in production instead
+  // of silently trusting localhost.
+  _corsOriginExplicit: Boolean(process.env.CORS_ORIGIN),
+
   jsonBodyLimit: process.env.JSON_BODY_LIMIT ?? '100kb',
+
+  redisUrl: process.env.REDIS_URL,
 
   // Trust proxy setting for Express — required so rate limiting reads the real
   // client IP (X-Forwarded-For) when running behind a reverse proxy (e.g. Render).
@@ -124,6 +143,7 @@ const config = Object.freeze({
   },
 
   demoRun: {
+    cacheTtlSeconds: parsePositiveInt(process.env.DEMO_RUN_CACHE_TTL_SECONDS, 15, 'DEMO_RUN_CACHE_TTL_SECONDS'),
     pollMaxWaitMs: parsePositiveInt(process.env.DEMO_RUN_POLL_MAX_WAIT_MS, 8_000, 'DEMO_RUN_POLL_MAX_WAIT_MS'),
     pollInitialDelayMs: parsePositiveInt(process.env.DEMO_RUN_POLL_INITIAL_DELAY_MS, 250, 'DEMO_RUN_POLL_INITIAL_DELAY_MS'),
     pollMaxDelayMs: parsePositiveInt(process.env.DEMO_RUN_POLL_MAX_DELAY_MS, 2_000, 'DEMO_RUN_POLL_MAX_DELAY_MS'),
@@ -133,6 +153,17 @@ const config = Object.freeze({
   // and pending transaction checks before force-exiting. Default is just over
   // the max polling window (30 s) so an in-flight poll can finish.
   shutdownTimeoutMs: parsePositiveInt(process.env.SHUTDOWN_TIMEOUT_MS, 35_000, 'SHUTDOWN_TIMEOUT_MS'),
+
+  // RPC retry with jittered exponential backoff for transient failures.
+  // 429 (rate-limited) and 5xx responses from public Stellar RPC endpoints are
+  // retried automatically so a brief throttle doesn't become a user-visible
+  // failure. Each retry delays baseDelayMs * 2^attempt with ±50 % jitter, capped
+  // at maxDelayMs. After maxRetries the call fails with code RPC_THROTTLED.
+  rpcRetry: {
+    maxRetries: parsePositiveInt(process.env.RPC_RETRY_MAX_RETRIES, 4, 'RPC_RETRY_MAX_RETRIES'),
+    baseDelayMs: parsePositiveInt(process.env.RPC_RETRY_BASE_DELAY_MS, 200, 'RPC_RETRY_BASE_DELAY_MS'),
+    maxDelayMs: parsePositiveInt(process.env.RPC_RETRY_MAX_DELAY_MS, 5_000, 'RPC_RETRY_MAX_DELAY_MS'),
+  },
 });
 
 export default config;
@@ -162,6 +193,24 @@ export function validateConfig(log = _consoleLog) {
   ) {
     errors.push(
       `Invalid PAYMENT_ADDRESS="${process.env.PAYMENT_ADDRESS}" — must be a valid G... Stellar address`,
+    );
+  }
+
+  // A forgotten CORS_ORIGIN in production silently falls back to
+  // http://localhost:3000, which fails closed for real users but is
+  // confusing to diagnose. Require it to be set explicitly instead.
+  if (config.nodeEnv === 'production' && !config._corsOriginExplicit) {
+    errors.push(
+      'CORS_ORIGIN must be set explicitly when NODE_ENV=production (refusing to fall back to http://localhost:3000)',
+    );
+  }
+
+  // credentials: true is always enabled on the CORS middleware (see index.js),
+  // so an origin of "*" is both spec-invalid and a footgun that would trust
+  // any site with credentialed requests. Reject it in every environment.
+  if (config.corsOrigin.includes('*')) {
+    errors.push(
+      "CORS_ORIGIN cannot include '*' because CORS is mounted with credentials: true — list explicit origin(s) instead",
     );
   }
 

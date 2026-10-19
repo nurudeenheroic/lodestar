@@ -28,6 +28,7 @@ async function loadConfig(overrides = {}) {
     'DEMO_RUN_POLL_MAX_WAIT_MS',
     'DEMO_RUN_POLL_INITIAL_DELAY_MS',
     'DEMO_RUN_POLL_MAX_DELAY_MS',
+    'DEMO_RUN_CACHE_TTL_SECONDS',
   ]) {
     if (!(key in overrides)) delete process.env[key];
   }
@@ -112,6 +113,27 @@ describe('config demoRun polling env validation', () => {
     });
     expect(config.demoRun.pollInitialDelayMs).toBe(250);
     expect(config.demoRun.pollMaxDelayMs).toBe(2000);
+  });
+});
+
+describe('config demo-run cache TTL validation', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    vi.restoreAllMocks();
+  });
+
+  it('defaults the demo-run cache TTL to 15 seconds', async () => {
+    expect((await loadConfig()).demoRun.cacheTtlSeconds).toBe(15);
+  });
+
+  it('accepts a positive integer override and falls back for invalid values', async () => {
+    expect((await loadConfig({ DEMO_RUN_CACHE_TTL_SECONDS: '30' })).demoRun.cacheTtlSeconds).toBe(30);
+    expect((await loadConfig({ DEMO_RUN_CACHE_TTL_SECONDS: '0' })).demoRun.cacheTtlSeconds).toBe(15);
+    expect(console.warn).toHaveBeenCalled();
   });
 });
 
@@ -228,6 +250,81 @@ describe('config AGENTS_CONTRACT_ID startup warning', () => {
   it('sets contract.agentsId to null when not provided', async () => {
     const config = await loadConfig();
     expect(config.contract.agentsId).toBeNull();
+  });
+});
+
+describe('config CORS_ORIGIN validation', () => {
+  let exitSpy;
+
+  beforeEach(() => {
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+    vi.restoreAllMocks();
+    exitSpy.mockRestore();
+  });
+
+  it('falls back to localhost outside production when CORS_ORIGIN is unset', async () => {
+    const config = await loadConfig({ NODE_ENV: 'development' });
+    expect(config.corsOrigin).toEqual(['http://localhost:3000']);
+  });
+
+  it('fails startup when NODE_ENV=production and CORS_ORIGIN is unset', async () => {
+    const log = { fatal: vi.fn(), warn: vi.fn() };
+    await loadConfig({ NODE_ENV: 'production' });
+    const { validateConfig } = await import('./config.js');
+    validateConfig(log);
+    expect(log.fatal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        errors: expect.arrayContaining([expect.stringContaining('CORS_ORIGIN must be set explicitly')]),
+      }),
+      expect.any(String),
+    );
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('does not fail startup when NODE_ENV=production and CORS_ORIGIN is set', async () => {
+    const log = { fatal: vi.fn(), warn: vi.fn() };
+    await loadConfig({ NODE_ENV: 'production', CORS_ORIGIN: 'https://app.example.com', AGENTS_CONTRACT_ID: 'C_AGENTS' });
+    const { validateConfig } = await import('./config.js');
+    validateConfig(log);
+    expect(log.fatal).not.toHaveBeenCalled();
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects CORS_ORIGIN="*" even outside production', async () => {
+    const log = { fatal: vi.fn(), warn: vi.fn() };
+    await loadConfig({ NODE_ENV: 'development', CORS_ORIGIN: '*' });
+    const { validateConfig } = await import('./config.js');
+    validateConfig(log);
+    expect(log.fatal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        errors: expect.arrayContaining([expect.stringContaining("cannot include '*'")]),
+      }),
+      expect.any(String),
+    );
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('rejects "*" mixed in with other explicit origins', async () => {
+    const log = { fatal: vi.fn(), warn: vi.fn() };
+    await loadConfig({ NODE_ENV: 'production', CORS_ORIGIN: 'https://app.example.com,*' });
+    const { validateConfig } = await import('./config.js');
+    validateConfig(log);
+    expect(log.fatal).toHaveBeenCalled();
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('parses a comma-separated CORS_ORIGIN into a trimmed array', async () => {
+    const config = await loadConfig({
+      CORS_ORIGIN: 'https://app.example.com, https://admin.example.com',
+    });
+    expect(config.corsOrigin).toEqual([
+      'https://app.example.com',
+      'https://admin.example.com',
+    ]);
   });
 });
 

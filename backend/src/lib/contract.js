@@ -25,7 +25,29 @@ import {
   SimulationError,
   TransactionFailedError,
   TransactionTimeoutError,
+  AGENT_ERROR,
+  AGENT_ERROR_SCOPE,
+  REGISTRY_ERROR_SCOPE,
+  contractErrorFromHostError,
 } from './contractErrors.js';
+import {
+  trackPendingTransaction,
+  removePendingTransaction,
+  getPendingTransactionCount,
+  getPendingTransactions,
+  dumpPendingTransactions,
+  resumePendingTransactions,
+  __resetPendingTransactions,
+} from './pendingTx.js';
+
+// Re-export pendingTx functions so contract.js public interface is unchanged
+export {
+  getPendingTransactionCount,
+  getPendingTransactions,
+  dumpPendingTransactions,
+  resumePendingTransactions,
+  __resetPendingTransactions,
+};
 
 
 const TIMEOUT = 30;
@@ -70,136 +92,28 @@ let lastSeqSyncTime = 0;
 const preparedRegistrySubmissions = new Map();
 let assembleTransactionForSubmit = rpc.assembleTransaction;
 
-// ── Pending Transactions Registry ──────────────────────────────────────────────
-//
-// Tracks every submitted Soroban transaction from sendTransaction until
-// getTransaction confirms it (SUCCESS or FAILED). On graceful shutdown the
-// registry is dumped to pending-transactions.json so operators can manually
-// verify on-chain status. On restart any still-unconfirmed hashes are
-// re-polled before accepting new requests.
-
-const pendingTransactions = new Map();
-const PENDING_TRANSACTIONS_FILE = 'pending-transactions.json';
-
-function getOperationName(operation) {
-  if (typeof operation === 'string') return operation;
-  try {
-    if (operation && typeof operation === 'object') {
-      if (operation.method) return operation.method;
-      if (operation._method) return operation._method;
-      if (operation.func) {
-        try {
-          return operation.func.invokeContract().functionName().toString();
-        } catch {}
-      }
-    }
-  } catch {}
-  return 'unknown';
-}
-
-function trackPendingTransaction(hash, operation) {
-  pendingTransactions.set(hash, {
-    hash,
-    operation: getOperationName(operation),
-    submittedAt: Date.now(),
-  });
-}
-
-function removePendingTransaction(hash) {
-  pendingTransactions.delete(hash);
-}
-
-export function getPendingTransactionCount() {
-  return pendingTransactions.size;
-}
-
-export function getPendingTransactions() {
-  return Array.from(pendingTransactions.values());
-}
-
-/** @note Exported for tests — not part of the public API. */
-export function __resetPendingTransactions() {
-  pendingTransactions.clear();
-}
-
-/**
- * Dump all currently-pending transaction entries to
- * pending-transactions.json for operator inspection. Safe to call
- * multiple times — overwrites the file each time.
- */
-export function dumpPendingTransactions() {
-  const entries = Array.from(pendingTransactions.values());
-  if (entries.length === 0) return;
-  try {
-    writeFileSync(PENDING_TRANSACTIONS_FILE, JSON.stringify(entries, null, 2), 'utf-8');
-    logger.warn(
-      { count: entries.length, file: PENDING_TRANSACTIONS_FILE },
-      'Dumped pending transactions to file',
-    );
-  } catch (err) {
-    logger.error({ err }, 'Failed to dump pending transactions');
-  }
-}
-
-/**
- * On startup, check for pending-transactions.json from a previous run and
- * attempt to re-poll any unconfirmed hashes. Confirmed or failed entries
- * are logged; still-unconfirmed entries are re-added to the in-memory
- * registry so the next shutdown will preserve them again.
- */
-export async function resumePendingTransactions() {
-  let entries;
-  try {
-    if (!existsSync(PENDING_TRANSACTIONS_FILE)) return;
-    const data = readFileSync(PENDING_TRANSACTIONS_FILE, 'utf-8');
-    entries = JSON.parse(data);
-  } catch {
-    return;
-  }
-
-  if (!Array.isArray(entries) || entries.length === 0) return;
-
-  logger.warn(
-    { count: entries.length, file: PENDING_TRANSACTIONS_FILE },
-    'Resuming polling for unconfirmed transactions from previous run',
-  );
-
-  const server = getStellarServer();
-  for (const entry of entries) {
-    try {
-      const getResult = await server.getTransaction(entry.hash);
-      if (getResult.status === 'SUCCESS') {
-        logger.info({ hash: entry.hash, operation: entry.operation }, 'Pending transaction from previous run confirmed SUCCESS');
-      } else if (getResult.status === 'FAILED') {
-        logger.warn({ hash: entry.hash, operation: entry.operation }, 'Pending transaction from previous run FAILED on-chain');
-      } else {
-        trackPendingTransaction(entry.hash, { method: entry.operation });
-        logger.warn({ hash: entry.hash, operation: entry.operation }, 'Pending transaction from previous run still unconfirmed, re-added to registry');
-      }
-    } catch (err) {
-      logger.error({ err, hash: entry.hash, operation: entry.operation }, 'Failed to check pending transaction from previous run');
-      trackPendingTransaction(entry.hash, { method: entry.operation });
-    }
-  }
-
-  // Only delete the file once every entry has been processed and re-tracked.
-  // If the process is killed mid-resume the file remains for the next restart.
-  try {
-    unlinkSync(PENDING_TRANSACTIONS_FILE);
-  } catch {
-    // best-effort — file may already be gone
-  }
-
-  if (pendingTransactions.size > 0) {
-    logger.warn(
-      { count: pendingTransactions.size },
-      'Pending transactions remain after resume — will be re-dumped on next shutdown',
-    );
-  }
-}
+// Pending transaction tracking is now imported from ./pendingTx.js
+// (trackPendingTransaction, removePendingTransaction, getPendingTransactionCount,
+// getPendingTransactions, dumpPendingTransactions, resumePendingTransactions,
+// __resetPendingTransactions).
 
 export function __setAssembleTransactionForTest(fn) {
   assembleTransactionForSubmit = fn ?? rpc.assembleTransaction;
+}
+
+/**
+ * Throw a typed `ContractError` when `details` carries a contract error code.
+ *
+ * `scope` selects the error map the numeric code is resolved against. It is
+ * required because `RegistryError` and `AgentError` are separate `#[repr(u32)]`
+ * enums whose discriminants overlap, so resolving an agents-contract failure
+ * against the registry map would report a different contract's error.
+ */
+function throwContractErrorIfPresent(details, scope) {
+  const contractError = contractErrorFromHostError(details, scope);
+  if (contractError) {
+    throw contractError;
+  }
 }
 
 export function getSubmitQueueDepth() {
@@ -284,6 +198,7 @@ async function _simulateAndSubmit(operation, signer, retryCount = 0) {
   logRpcCall('simulateTransaction', Date.now() - simStart);
 
   if (rpc.Api.isSimulationError(simResult)) {
+    throwContractErrorIfPresent(simResult.error, REGISTRY_ERROR_SCOPE);
     throw new SimulationError(`Simulation failed: ${simResult.error}`, simResult.error);
   }
 
@@ -314,7 +229,9 @@ async function _simulateAndSubmit(operation, signer, retryCount = 0) {
       logger.warn({ retryCount }, 'txBAD_SEQ encountered, retrying transaction');
       return _simulateAndSubmit(operation, signer, retryCount + 1);
     }
-    throw new TransactionFailedError(`Transaction failed: ${JSON.stringify(sendResult.errorResult || sendResult)}`, sendResult.hash, sendResult.errorResult || sendResult);
+    const details = sendResult.errorResult || sendResult;
+    throwContractErrorIfPresent(details, REGISTRY_ERROR_SCOPE);
+    throw new TransactionFailedError(`Transaction failed: ${JSON.stringify(details)}`, sendResult.hash, details);
   }
 
   const txHash = sendResult.hash;
@@ -340,6 +257,7 @@ async function _simulateAndSubmit(operation, signer, retryCount = 0) {
   removePendingTransaction(txHash);
 
   if (getResult.status === 'FAILED') {
+    throwContractErrorIfPresent(getResult, REGISTRY_ERROR_SCOPE);
     throw new TransactionFailedError(`Transaction failed on-chain: ${sendResult.hash}`, sendResult.hash, getResult);
   }
 
@@ -395,13 +313,14 @@ async function buildUnsignedTx(operation) {
 
   const simResult = await server.simulateTransaction(tx);
   if (rpc.Api.isSimulationError(simResult)) {
+    throwContractErrorIfPresent(simResult.error, REGISTRY_ERROR_SCOPE);
     throw new ContractError(`Simulation failed: ${simResult.error}`, 'SIMULATION_FAILED');
   }
 
   return assembleTransactionForSubmit(tx, simResult).build().toXDR();
 }
 
-async function simulateRead(operation) {
+async function simulateRead(operation, scope = REGISTRY_ERROR_SCOPE) {
   const server = getStellarServer();
   const keypair = getServerKeypair();
   const passphrase = getNetworkPassphrase();
@@ -421,13 +340,14 @@ async function simulateRead(operation) {
   logRpcCall('simulateTransaction', Date.now() - simStart);
 
   if (rpc.Api.isSimulationError(simResult)) {
+    throwContractErrorIfPresent(simResult.error, scope);
     throw new ContractError(`Simulation failed: ${simResult.error}`, 'SIMULATION_FAILED');
   }
 
   return simResult.result?.retval;
 }
 
-export async function simulateReadBatch(operations) {
+export async function simulateReadBatch(operations, scope = REGISTRY_ERROR_SCOPE) {
   if (operations.length === 0) return [];
 
   const server = getStellarServer();
@@ -450,6 +370,7 @@ export async function simulateReadBatch(operations) {
     logRpcCall('simulateTransaction', Date.now() - simStart);
 
     if (rpc.Api.isSimulationError(simResult)) {
+      throwContractErrorIfPresent(simResult.error, scope);
       throw new ContractError(`Batch simulation failed: ${simResult.error}`, 'SIMULATION_FAILED');
     }
 
@@ -460,7 +381,7 @@ export async function simulateReadBatch(operations) {
 }
 
 
-export async function listServices({ category, page = 0, pageSize = 20 } = {}) {
+export async function listServices({ category, offset = 0, limit = 20 } = {}) {
   try {
     const contract = getContract();
 
@@ -469,9 +390,9 @@ export async function listServices({ category, page = 0, pageSize = 20 } = {}) {
       : xdr.ScVal.scvVoid();
 
     const callOp = contract.call(
-      'list_services_page',
-      nativeToScVal(page, { type: 'u32' }),
-      nativeToScVal(pageSize, { type: 'u32' }),
+      'list_services',
+      nativeToScVal(offset, { type: 'u32' }),
+      nativeToScVal(limit, { type: 'u32' }),
       optionArg,
     );
     const retval = await simulateRead(callOp);
@@ -540,11 +461,11 @@ export async function getServiceCount() {
 
 export const contractHelpers = {
   activeServiceExists: async function (provider, endpoint, fetchServices = listServices) {
-    let page = 0;
-    const pageSize = 20;
+    let offset = 0;
+    const limit = 20;
 
     while (true) {
-      const services = await fetchServices({ page, pageSize });
+      const services = await fetchServices({ offset, limit });
       if (!services.length) {
         return false;
       }
@@ -553,16 +474,16 @@ export const contractHelpers = {
         return true;
       }
 
-      page += 1;
+      offset += limit;
     }
   },
 
   activeServiceExistsByName: async function (provider, name, fetchServices = listServices) {
-    let page = 0;
-    const pageSize = 20;
+    let offset = 0;
+    const limit = 20;
 
     while (true) {
-      const services = await fetchServices({ page, pageSize });
+      const services = await fetchServices({ offset, limit });
       if (!services.length) {
         return false;
       }
@@ -571,7 +492,7 @@ export const contractHelpers = {
         return true;
       }
 
-      page += 1;
+      offset += limit;
     }
   },
 };
@@ -585,18 +506,18 @@ export async function activeServiceExistsByName(provider, name, fetchServices = 
 }
 
 export async function listServicesByProvider(provider, fetchServices = listServices) {
-  let page = 0;
-  const pageSize = 20;
+  let offset = 0;
+  const limit = 20;
   const matches = [];
 
   while (true) {
-    const services = await fetchServices({ page, pageSize });
+    const services = await fetchServices({ offset, limit });
     if (!services.length) {
       return matches;
     }
 
     matches.push(...services.filter((service) => service.provider === provider));
-    page += 1;
+    offset += limit;
   }
 }
 
@@ -686,6 +607,9 @@ export async function deactivateServiceOnChain(id, providerAddress) {
     try {
       retval = await simulateRead(readOp);
     } catch (readErr) {
+      if (readErr instanceof ContractError && readErr.code === 'SERVICE_NOT_FOUND') {
+        throw readErr;
+      }
       // simulateRead threw — this is an RPC/simulation failure, not "not found"
       logger.error({ err: readErr, id }, 'deactivateServiceOnChain: failed to read service from chain');
       throw new ContractError(
@@ -763,6 +687,17 @@ export async function buildUnsignedRegistryTx(action, providerAddress, params = 
     return createPreparedRegistrySubmission(action, xdr);
   }
 
+  if (action === 'reactivate') {
+    const op = contract.call(
+      'reactivate_service',
+      nativeToScVal(provider, { type: 'address' }),
+      nativeToScVal(BigInt(params.id), { type: 'u64' })
+    );
+
+    const xdr = await buildUnsignedTx(op);
+    return createPreparedRegistrySubmission(action, xdr);
+  }
+
   throw new Error(`Unknown registry action: ${action}`);
 }
 
@@ -786,9 +721,11 @@ export function validatePreparedRegistrySubmission(submitToken, signedXdr) {
   }
 
   const [operation] = tx.operations;
-  const expectedFunctionName = prepared.action === 'register'
-    ? 'register_service'
-    : 'deactivate_service';
+  const expectedFunctionName = {
+    register: 'register_service',
+    deactivate: 'deactivate_service',
+    reactivate: 'reactivate_service',
+  }[prepared.action];
 
   const isRegistryInvocation = Boolean(
     operation &&
@@ -832,7 +769,7 @@ export async function updateReputation(id, positive, agentAddress) {
 
     const before = await getService(id);
     if (!before) {
-      throw new Error(`Service ${id} not found before reputation update`);
+      throw new ContractError(`Service ${id} not found`, 'SERVICE_NOT_FOUND');
     }
 
     const contract = getContract();
@@ -846,7 +783,7 @@ export async function updateReputation(id, positive, agentAddress) {
 
     const after = await getService(id);
     if (!after) {
-      throw new Error(`Failed to read updated reputation for service ${id}`);
+      throw new ContractError(`Service ${id} not found`, 'SERVICE_NOT_FOUND');
     }
 
     const newReputation = after.reputation;
@@ -910,7 +847,7 @@ export async function listAgents(limit = 50) {
   try {
     const contract = getAgentsContract();
     const op = contract.call('list_agents', nativeToScVal(limit, { type: 'u32' }));
-    const retval = await simulateRead(op);
+    const retval = await simulateRead(op, AGENT_ERROR_SCOPE);
     if (!retval) return [];
     const vec = scValToNative(retval);
     if (!Array.isArray(vec)) return [];
@@ -929,7 +866,7 @@ export async function listAgentsPage(page = 0, pageSize = 20) {
       nativeToScVal(page, { type: 'u32' }),
       nativeToScVal(pageSize, { type: 'u32' })
     );
-    const retval = await simulateRead(op);
+    const retval = await simulateRead(op, AGENT_ERROR_SCOPE);
     if (!retval) return [];
     const vec = scValToNative(retval);
     if (!Array.isArray(vec)) return [];
@@ -947,7 +884,7 @@ export async function getAgent(agentAddress) {
       'get_agent',
       nativeToScVal(Address.fromString(agentAddress), { type: 'address' })
     );
-    const retval = await simulateRead(op);
+    const retval = await simulateRead(op, AGENT_ERROR_SCOPE);
     if (!retval) return null;
     const native = scValToNative(retval);
     if (!native) return null;
@@ -972,7 +909,7 @@ export async function isAgentRegistered(agentAddress) {
       'is_registered',
       nativeToScVal(Address.fromString(agentAddress), { type: 'address' })
     );
-    const retval = await simulateRead(op);
+    const retval = await simulateRead(op, AGENT_ERROR_SCOPE);
     if (!retval) return false;
     return scValToNative(retval);
   } catch (err) {
@@ -988,7 +925,7 @@ export async function getAgentPolicy(agentAddress) {
       'get_policy',
       nativeToScVal(Address.fromString(agentAddress), { type: 'address' })
     );
-    const retval = await simulateRead(op);
+    const retval = await simulateRead(op, AGENT_ERROR_SCOPE);
     if (!retval) return null;
     const native = scValToNative(retval);
     if (!native) return null;
@@ -999,6 +936,19 @@ export async function getAgentPolicy(agentAddress) {
   }
 }
 
+/**
+ * Read an agent's credit score.
+ *
+ * `get_score` returns `Err(AgentError::AgentNotFound)` rather than an in-band
+ * sentinel, so a missing agent is reported as `null` instead of being
+ * indistinguishable from a real score. Every other failure (RPC, simulation,
+ * malformed address) is rethrown so the caller can tell "no score yet" apart
+ * from "we could not read the score".
+ *
+ * @param {string} agentAddress - Stellar address of the agent
+ * @returns {Promise<number|null>} The score, or `null` when the agent is not registered
+ * @throws {ContractError} `AGENT_NOT_FOUND` if the agent is not registered
+ */
 export async function getAgentScore(agentAddress) {
   try {
     const contract = getAgentsContract();
@@ -1006,12 +956,15 @@ export async function getAgentScore(agentAddress) {
       'get_score',
       nativeToScVal(Address.fromString(agentAddress), { type: 'address' })
     );
-    const retval = await simulateRead(op);
-    if (!retval) return -1;
+    const retval = await simulateRead(op, AGENT_ERROR_SCOPE);
+    if (!retval) return null;
     return Number(scValToNative(retval));
   } catch (err) {
+    if (err instanceof ContractError && err.contractErrorCode === AGENT_ERROR.AGENT_NOT_FOUND) {
+      return null;
+    }
     logger.error({ err, agentAddress }, 'getAgentScore failed');
-    return -1;
+    throw err;
   }
 }
 
@@ -1019,7 +972,7 @@ export async function getAgentCount() {
   try {
     const contract = getAgentsContract();
     const op = contract.call('get_agent_count');
-    const retval = await simulateRead(op);
+    const retval = await simulateRead(op, AGENT_ERROR_SCOPE);
     if (!retval) return 0;
     return Number(scValToNative(retval));
   } catch (err) {
@@ -1082,7 +1035,7 @@ export async function isAgentEligible(agentAddress, minScore) {
       nativeToScVal(Address.fromString(agentAddress), { type: 'address' }),
       nativeToScVal(minScore, { type: 'i32' })
     );
-    const retval = await simulateRead(op);
+    const retval = await simulateRead(op, AGENT_ERROR_SCOPE);
     if (!retval) return false;
     return Boolean(scValToNative(retval));
   } catch (err) {
@@ -1099,7 +1052,7 @@ export async function checkSpendingAllowed(agentAddress, amountStroops) {
       nativeToScVal(Address.fromString(agentAddress), { type: 'address' }),
       nativeToScVal(BigInt(amountStroops), { type: 'i128' })
     );
-    const retval = await simulateRead(op);
+    const retval = await simulateRead(op, AGENT_ERROR_SCOPE);
     if (!retval) return false;
     return Boolean(scValToNative(retval));
   } catch (err) {
@@ -1250,6 +1203,7 @@ async function submitSignedTx(signedXdr) {
   const sendResult = await server.sendTransaction(tx);
   logRpcCall('sendTransaction', Date.now() - sendStart);
   if (sendResult.status === 'ERROR') {
+    throwContractErrorIfPresent(sendResult.errorResult || sendResult, REGISTRY_ERROR_SCOPE);
     throw new TransactionFailedError(`Transaction failed: ${JSON.stringify(sendResult.errorResult)}`, sendResult.hash, sendResult.errorResult);
   }
 
@@ -1274,6 +1228,7 @@ async function submitSignedTx(signedXdr) {
   removePendingTransaction(signedTxHash);
 
   if (getResult.status === 'FAILED') {
+    throwContractErrorIfPresent(getResult, REGISTRY_ERROR_SCOPE);
     throw new TransactionFailedError(`Transaction failed on-chain: ${sendResult.hash}`, sendResult.hash, getResult);
   }
 
